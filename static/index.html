@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClauseCite</title>
+<style>
+  :root { --ink: #1c1c1c; --muted: #6b6b6b; --line: #e3e1dc; --bg: #faf9f6; --accent: #8a5a00; --hit: #fff2c4; --cite: #ffd666; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); height: 100vh; display: grid; grid-template-columns: 420px 1fr; }
+  aside { border-right: 1px solid var(--line); padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+  main { overflow-y: auto; padding: 24px 40px; }
+  h1 { font-size: 20px; margin: 0; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0; }
+  label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  select, textarea, button { font: inherit; width: 100%; }
+  select, textarea { padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  textarea { resize: vertical; min-height: 70px; }
+  .buttons { display: flex; gap: 8px; }
+  button { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--ink); background: var(--ink); color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--ink); }
+  button:disabled { opacity: .5; cursor: default; }
+  #answer { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 14px; white-space: pre-wrap; }
+  #answer:empty { display: none; }
+  #answer .error { color: #a40000; }
+  sup.cite { color: var(--accent); cursor: pointer; font-weight: 700; padding: 0 1px; }
+  #status { color: var(--muted); font-size: 13px; min-height: 1em; }
+  #contract-title { font-size: 16px; margin: 0 0 12px; }
+  #contract { white-space: pre-wrap; font: 14px/1.6 Georgia, "Times New Roman", serif; max-width: 860px; }
+  mark.hit { background: var(--hit); }
+  mark.cite { background: var(--cite); outline: 2px solid var(--accent); }
+</style>
+</head>
+<body>
+<aside>
+  <div>
+    <h1>ClauseCite</h1>
+    <p class="sub">Ask a question about a contract. Every claim in the answer links to the contract text it came from.</p>
+  </div>
+  <label for="contract-select">Contract</label>
+  <select id="contract-select"></select>
+  <label for="category">Clause type (optional, sharpens search)</label>
+  <select id="category"><option value="">Any</option></select>
+  <label for="question">Question</label>
+  <textarea id="question" placeholder="Can either party terminate without cause?"></textarea>
+  <div class="buttons">
+    <button id="ask">Ask</button>
+    <button id="search" class="secondary">Search only</button>
+  </div>
+  <div id="status"></div>
+  <div id="answer"></div>
+</aside>
+<main>
+  <h2 id="contract-title"></h2>
+  <div id="contract"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let contractText = "";
+
+async function api(path, body) {
+  const res = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+}
+
+// Render the contract with highlighted ranges. Later ranges win where they overlap.
+function renderContract(ranges) {
+  const marks = new Array(contractText.length + 1).fill(null);
+  for (const r of ranges) for (let i = r.start; i < r.end; i++) marks[i] = r;
+  let html = "", i = 0;
+  while (i < contractText.length) {
+    let j = i;
+    while (j < contractText.length && marks[j] === marks[i]) j++;
+    const text = escapeHtml(contractText.slice(i, j)), r = marks[i];
+    html += r ? `<mark class="${r.kind}" id="${r.anchor || ""}">${text}</mark>` : text;
+    i = j;
+  }
+  $("contract").innerHTML = html;
+}
+
+async function loadContract() {
+  const c = await api(`/api/contracts/${$("contract-select").value}`);
+  contractText = c.text;
+  $("contract-title").textContent = c.title;
+  $("answer").innerHTML = "";
+  renderContract([]);
+}
+
+function query() {
+  return { contract_id: $("contract-select").value, question: $("question").value.trim(), category: $("category").value || null };
+}
+
+async function run(withAnswer) {
+  const q = query();
+  if (!q.question) return;
+  $("ask").disabled = $("search").disabled = true;
+  $("status").textContent = withAnswer ? "Searching and asking Claude…" : "Searching…";
+  $("answer").innerHTML = "";
+  try {
+    const data = await api(withAnswer ? "/api/ask" : "/api/search", q);
+    const ranges = data.hits.map((h) => ({ ...h, kind: "hit" }));
+    if (withAnswer) {
+      let n = 0, html = "";
+      for (const seg of data.answer.segments) {
+        html += escapeHtml(seg.text);
+        for (const c of seg.citations) {
+          n++;
+          ranges.push({ start: c.start, end: c.end, kind: "cite", anchor: `cite-${n}` });
+          html += `<sup class="cite" data-n="${n}" title="${escapeHtml(c.quote)}">[${n}]</sup>`;
+        }
+      }
+      $("answer").innerHTML = html;
+    }
+    renderContract(ranges);
+    $("status").textContent = `${data.hits.length} excerpts retrieved` + (withAnswer ? ". Click a [n] to jump to the cited text." : ", highlighted on the right.");
+    document.querySelector("mark.cite, mark.hit")?.scrollIntoView({ block: "center" });
+  } catch (e) {
+    $("status").textContent = "";
+    $("answer").innerHTML = `<span class="error">${escapeHtml(e.message)}</span>`;
+  } finally {
+    $("ask").disabled = $("search").disabled = false;
+  }
+}
+
+$("answer").addEventListener("click", (e) => {
+  const n = e.target.dataset?.n;
+  if (n) document.getElementById(`cite-${n}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+});
+$("ask").addEventListener("click", () => run(true));
+$("search").addEventListener("click", () => run(false));
+$("contract-select").addEventListener("change", loadContract);
+
+(async () => {
+  const { contracts, categories } = await api("/api/contracts");
+  $("contract-select").innerHTML = contracts.map((c) => `<option value="${c.id}">${escapeHtml(c.title)}</option>`).join("");
+  $("category").innerHTML += categories.map((c) => `<option>${escapeHtml(c)}</option>`).join("");
+  await loadContract();
+})();
+</script>
+</body>
+</html>
